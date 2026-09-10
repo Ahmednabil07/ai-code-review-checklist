@@ -1,0 +1,135 @@
+#!/usr/bin/env bash
+#
+# The AI Code Review Kit — automated pre-merge gate
+#
+# Catches the mechanically-detectable subset of the eight failure modes.
+# It cannot check your logic. It can stop you shipping a secret at 1am.
+#
+# INSTALL:
+#   cp pre-commit .git/hooks/pre-commit && chmod +x .git/hooks/pre-commit
+#
+# BYPASS (deliberately, when you have actually thought about it):
+#   git commit --no-verify
+#
+# Exit codes: 0 = clean or warnings only, 1 = blocker found
+
+set -uo pipefail
+
+RED=$'\033[0;31m'; YEL=$'\033[0;33m'; GRN=$'\033[0;32m'; DIM=$'\033[2m'; OFF=$'\033[0m'
+
+BLOCKERS=0
+WARNINGS=0
+
+# Only added lines in staged changes. We do not care what was already there.
+ADDED=$(git diff --cached --unified=0 --diff-filter=ACM | grep '^+' | grep -v '^+++' || true)
+FILES=$(git diff --cached --name-only --diff-filter=ACM || true)
+
+[ -z "$ADDED" ] && exit 0
+
+block() {
+  BLOCKERS=$((BLOCKERS + 1))
+  printf '%s BLOCKER %s %s\n' "$RED" "$OFF" "$1"
+  [ -n "${2:-}" ] && printf '%s   %s%s\n' "$DIM" "$2" "$OFF"
+}
+
+warn() {
+  WARNINGS=$((WARNINGS + 1))
+  printf '%s WARN    %s %s\n' "$YEL" "$OFF" "$1"
+  [ -n "${2:-}" ] && printf '%s   %s%s\n' "$DIM" "$2" "$OFF"
+}
+
+hits() { printf '%s' "$ADDED" | grep -nEi "$1" 2>/dev/null | head -3 || true; }
+
+echo ""
+echo "  Pre-merge gate — scanning staged changes"
+echo "  ----------------------------------------"
+
+# ---------------------------------------------------------------- BLOCKERS
+
+# 1. Secrets. Assignment of a long literal to a credential-shaped name.
+FOUND=$(hits '(api[_-]?key|secret|passwd|password|token|credential|private[_-]?key)[[:space:]]*[:=][[:space:]]*["'"'"'][A-Za-z0-9_/+.-]{16,}')
+[ -n "$FOUND" ] && block "Possible hardcoded secret." "$(printf '%s' "$FOUND" | head -2)"
+
+# 2. Private key blocks.
+FOUND=$(hits 'BEGIN (RSA |EC |OPENSSH |PGP )?PRIVATE KEY')
+[ -n "$FOUND" ] && block "Private key material in the diff."
+
+# 3. Known credential formats.
+FOUND=$(hits '(AKIA[0-9A-Z]{16}|sk-[A-Za-z0-9]{20,}|ghp_[A-Za-z0-9]{36}|xox[baprs]-)')
+[ -n "$FOUND" ] && block "Recognised credential format (AWS / OpenAI / GitHub / Slack)."
+
+# 4. Disabled transport security.
+FOUND=$(hits '(verify[[:space:]]*=[[:space:]]*False|rejectUnauthorized[[:space:]]*:[[:space:]]*false|NODE_TLS_REJECT_UNAUTHORIZED|InsecureSkipVerify[[:space:]]*:[[:space:]]*true|curl .*(-k|--insecure))')
+[ -n "$FOUND" ] && block "TLS verification disabled." "$(printf '%s' "$FOUND" | head -1)"
+
+# 5. String-built SQL. The injection classic.
+SQLQ=$(printf '%s' "$ADDED" | grep -Ei '(SELECT[[:space:]]+|INSERT[[:space:]]+INTO|UPDATE[[:space:]]+[A-Za-z_]|DELETE[[:space:]]+FROM)' 2>/dev/null || true)
+FOUND=$(printf '%s' "$SQLQ" | grep -E '("[[:space:]]*\+|\+[[:space:]]*"|'"'"'[[:space:]]*\+|\+[[:space:]]*'"'"'|\$\{|%s|f"|\.format\(|%[[:space:]]*\()' 2>/dev/null | head -2 || true)
+[ -n "$FOUND" ] && block "SQL appears to be built by string interpolation. Use bound parameters." "$(printf '%s' "$FOUND" | head -1)"
+
+# 6. Unscoped destructive statements.
+FOUND=$(hits '(DELETE[[:space:]]+FROM|UPDATE)[[:space:]]+[A-Za-z_][A-Za-z0-9_]*[[:space:]]*(;|"|'"'"'|$)')
+[ -n "$FOUND" ] && block "DELETE or UPDATE with no WHERE clause." "$(printf '%s' "$FOUND" | head -1)"
+
+FOUND=$(hits '(DROP[[:space:]]+(TABLE|DATABASE|SCHEMA)|TRUNCATE[[:space:]]+TABLE)')
+[ -n "$FOUND" ] && block "Destructive schema operation in application code."
+
+# ---------------------------------------------------------------- WARNINGS
+
+# 7. Swallowed errors — failure mode #4.
+FOUND=$(hits '(except[[:space:]]*(Exception)?[[:space:]]*(as[[:space:]]+[a-z_]+)?[[:space:]]*:[[:space:]]*(pass|continue)|catch[[:space:]]*\([^)]*\)[[:space:]]*\{[[:space:]]*\}|except[[:space:]]*:)')
+[ -n "$FOUND" ] && warn "Error caught and discarded. Handle it or let it crash."
+
+# 8. Wildcard CORS.
+FOUND=$(hits '(Access-Control-Allow-Origin[^a-zA-Z]+\*|cors\(\)|origin[[:space:]]*:[[:space:]]*.\*.)')
+[ -n "$FOUND" ] && warn "Permissive CORS configuration."
+
+# 9. Debug leftovers.
+FOUND=$(hits '(^\+[[:space:]]*(console\.(log|debug)|print\(|var_dump|dd\(|debugger;|binding\.pry|pdb\.set_trace|fmt\.Print))')
+[ -n "$FOUND" ] && warn "Debug statement left in the diff."
+
+# 10. New dependencies — failure mode #2, the phantom package.
+DEPS=$(printf '%s' "$FILES" | grep -E '(package\.json|requirements.*\.txt|Gemfile|go\.mod|Cargo\.toml|pyproject\.toml|composer\.json)$' || true)
+if [ -n "$DEPS" ]; then
+  warn "Dependency manifest changed. Verify every new package actually exists." \
+       "Hallucinated package names are a real supply-chain attack vector."
+fi
+
+# 11. Queries inside loops — failure mode #7.
+FOUND=$(hits '^\+[[:space:]]{8,}.*(\.query\(|\.findOne\(|\.execute\(|fetch\(|requests\.(get|post)|axios\.(get|post)|\.objects\.(get|filter))')
+[ -n "$FOUND" ] && warn "Data access nested inside a block. Check for N+1."
+
+# 12. Skipped tests.
+FOUND=$(hits '(\.skip\(|@skip|@pytest\.mark\.skip|xit\(|xdescribe\(|t\.Skip\(|# *type: *ignore)')
+[ -n "$FOUND" ] && warn "Test or type check being skipped."
+
+# 13. Review-surface warning.
+COUNT=$(printf '%s' "$ADDED" | wc -l | tr -d ' ')
+if [ "$COUNT" -gt 400 ]; then
+  warn "$COUNT added lines in one commit." \
+       "Beyond roughly 400 lines you are skimming, not reviewing. Consider splitting."
+fi
+
+# ---------------------------------------------------------------- VERDICT
+
+echo ""
+if [ "$BLOCKERS" -gt 0 ]; then
+  printf '%s  %d blocker(s), %d warning(s). Commit stopped.%s\n' "$RED" "$BLOCKERS" "$WARNINGS" "$OFF"
+  echo ""
+  echo "  Fix them, or bypass deliberately with: git commit --no-verify"
+  echo ""
+  exit 1
+fi
+
+if [ "$WARNINGS" -gt 0 ]; then
+  printf '%s  %d warning(s). Commit allowed.%s\n' "$YEL" "$WARNINGS" "$OFF"
+else
+  printf '%s  Clean.%s\n' "$GRN" "$OFF"
+fi
+
+echo ""
+echo "  Automated checks cannot verify your logic."
+echo "  Before you merge: read every conditional, grep for what you just"
+echo "  rebuilt, and explain the diff to yourself without the AI."
+echo ""
+exit 0
